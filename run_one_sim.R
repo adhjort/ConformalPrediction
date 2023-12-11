@@ -1,7 +1,4 @@
-source("./version2/helping_functions.R")
-source("./version2/kstest.R")
-source("./version2/prepare_final_dataset.R")
-
+source("./helping_functions.R")
 # Formulas
 formulas = list(pred = as.formula(SalePrice ~ PRom + BRA + lng + lat + Altitude  + NumberOfBedrooms + 
                                     Floor + YearsSinceBuilt + CoastDistance + LakeDistance + NumberOfUnitsOnAddress + 
