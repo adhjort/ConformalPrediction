@@ -40,6 +40,38 @@ TrainModels = function(train_df,
     calibration_df$predictions = predict(pred_model, dcalibrate) 
     test_df$predictions = predict(pred_model, dtest)
   } 
+  else if(prediction_model %in% c("lightgbm")){
+    
+    cat("STEP 1: Training LightGBM \n")
+    
+    
+    model_data_train <- model.frame(model_formula, train_df)
+    features_train <- model.matrix(model_formula, model_data_train)[, -1]
+    
+    model_data_calibration <- model.frame(model_formula, calibration_df)
+    features_calibration <- model.matrix(model_formula, model_data_calibration)[, -1]
+    
+    model_data_test <- model.frame(model_formula, test_df)
+    features_test <- model.matrix(model_formula, model_data_test)[, -1]
+    
+    # Create LightGBM dataset
+    lgb_train <- lgb.Dataset(data = as.matrix(features_train), label = model_data_train$SalePrice)
+    
+    # Train the model
+    pred_model <- lgb.train(
+      params = list(learning_rate = 0.03, max_depth = 4,objective = "regression"),
+      data = lgb_train,
+      nrounds = 1000,
+      verbose = -1
+    )
+    
+    ### Predict
+    cat("STEP 2: Predicting on train, calibration and test \n")
+    
+    train_df$predictions = predict(pred_model, features_train)
+    calibration_df$predictions = predict(pred_model, features_calibration) 
+    test_df$predictions = predict(pred_model, features_test)
+  }
   else if(prediction_model %in% c("lm")){
     pred_model = lm(formula = model_formula, 
                     data = train_df)
@@ -252,153 +284,86 @@ MLE_gridsearch_sigma = function(H, X, Y, gridsize = 10, rho, return_full_df = FA
   
 }
 
-CreateSyntheticData = function(df_oslo, model_formula, data_generating_model, seed){
+
+
+
+
+CreateSyntheticData_simple_holdout = function(df_holdout, df_synthetic, seed, noise_type){
   
-  dfs = DataSplit(df_oslo = df_oslo, seed = seed)
+  # Formula without any coordinates or city district
+  simple_formula = as.formula(SalePrice ~ PRom + BRA + Altitude  + NumberOfBedrooms + 
+                                Floor + YearsSinceBuilt + CoastDistance + LakeDistance + NumberOfUnitsOnAddress + 
+                                HomesNearby + OtherBuildingsNearby + Balcony + Elevator + SaleMonth)
   
-  train_df = dfs$train_df
-  calibration_df = dfs$calibration_df
-  test_df = dfs$test_df
+  model_data_holdout <- model.frame(simple_formula, df_holdout)
+  features_holdout <- model.matrix(simple_formula, model_data_holdout)[, -1]
   
-  # Transform to dummy
-  # https://stackoverflow.com/questions/48649443/how-to-one-hot-encode-several-categorical-variables-in-r
-  train_dummy = caret::dummyVars(" ~ .", data = train_df %>% select(CityDistrict), fullRank = TRUE)
-  calibration_dummy = caret::dummyVars(" ~ .", data = calibration_df %>% select(CityDistrict), fullRank = TRUE)
-  test_dummy = caret::dummyVars(" ~ .", data = test_df %>% select(CityDistrict), fullRank = TRUE)
+  model_data_synthetic <- model.frame(simple_formula, df_synthetic)
+  features_synthetic <- model.matrix(simple_formula, model_data_synthetic)[, -1]
+  
+  # Create LightGBM dataset
+  lgb_train <- lgb.Dataset(data = as.matrix(features_holdout), label = model_data_holdout$SalePrice)
+  
+  # Train the model
+  pred_model <- lgb.train(
+    params = list(learning_rate = 0.03, max_depth = 4,objective = "regression"),
+    data = lgb_train,
+    nrounds = 1000,
+    verbose = -1
+  )
+  
+  ### Predict
+  synthetic_preds = predict(pred_model, features_synthetic)
+  
+  max_lng = max(df_synthetic$lng)
+  min_lng = min(df_synthetic$lng)
+  lng_diff = max_lng - min_lng
+  
+  max_lat = max(df_synthetic$lat)
+  min_lat = min(df_synthetic$lat)
+  lat_diff = max_lat - min_lat
+  
+  scale_factor = 1
+  df_synthetic = df_synthetic %>% 
+    mutate(lng_norm = (lng - min_lng)/lng_diff, 
+           lat_norm = (lat - min_lat)/lat_diff, 
+           preds = as.numeric(synthetic_preds), 
+           noise1 = scale_factor, 
+           noise2 = scale_factor*(lng_norm + lat_norm), 
+           noise3 = abs(sin(4*pi*lng_norm) + sin(4*pi*lat_norm)))
+ 
   
   
-  train_df_dummy = data.frame(predict(train_dummy, train_df))
-  calibration_df_dummy = data.frame(predict(calibration_dummy, calibration_df))
-  test_df_dummy = data.frame(predict(test_dummy, test_df))
-  
-  # Get relevant column names
-  relevant_columns = all.vars(model_formula)[-1]
-  
-  # Get X matrix
-  X_train = train_df %>% dplyr::select(relevant_columns) %>% select(-CityDistrict, -lng, -lat) %>% 
-    cbind(train_df_dummy) %>% as.matrix()
-  
-  X_calibration = calibration_df %>% dplyr::select(relevant_columns) %>% select(-CityDistrict,  -lng, -lat) %>% 
-    cbind(calibration_df_dummy) %>% as.matrix()
-  
-  X_test = test_df %>% dplyr::select(relevant_columns) %>% select(-CityDistrict,-lng, -lat) %>% 
-    cbind(test_df_dummy) %>% as.matrix()
-  
-  N_train = NROW(X_train)
-  N_calibration = NROW(X_calibration)
-  N_test = NROW(X_test)
-  
-  # Get L matrix
-  L_train = train_df %>% select(Longitude, Latitude) %>% as.matrix()
-  L_calibration = calibration_df %>% select(Longitude, Latitude) %>% as.matrix()
-  L_test = test_df %>% select(Longitude, Latitude) %>% as.matrix()
-  
-  H_train = as.matrix(dist(L_train, method = "manhattan"))/1000 # distance in kilometers
-  H_calibration = as.matrix(dist(L_calibration, method = "manhattan"))/1000 # distance in kilometers
-  H_test = as.matrix(dist(L_test, method = "manhattan"))/1000 # distance in kilometers
-  
-  # Get Y matrix
-  Y_train = train_df %>% select(SalePrice) %>% as.matrix()
-  Y_calibration = calibration_df %>% select(SalePrice) %>% as.matrix()
-  Y_test = test_df %>% select(SalePrice) %>% as.matrix()
-  
-  if(data_generating_model == "spatial"){
+  if(noise_type == 1){
+    df_synthetic$noise_sigma = df_synthetic$noise1
+   
     
-    # Generate data
-    
-    mle_params = MLE_gridsearch(H = H_train, X = X_train, Y = Y_train, gridsize = 10, return_full_df = FALSE)
-    rho_hat = exp(mle_params$estimate[1])
-    sigma_eps_hat = exp(mle_params$estimate[2])
-    
-    cat("MLE found: \n")
-    cat("\t rho: ", rho_hat, "\n")
-    cat("\t sigma_eps: ", sigma_eps_hat, "\n")
-    
-    # Train
-    train_list = GetBetaAndSigma(X = X_train, Y = Y_train, L = L_train, rho_mle = rho_hat, sigma_eps_mle = sigma_eps_hat)
-    calibration_list = GetBetaAndSigma(X = X_calibration, Y = Y_calibration, L = L_calibration, rho_mle = rho_hat, sigma_eps_mle = sigma_eps_hat)
-    test_list = GetBetaAndSigma(X = X_test, Y = Y_test, L = L_test, rho_mle = rho_hat, sigma_eps_mle = sigma_eps_hat)
-    
-    beta_mle = train_list$beta
-    Sigma_train = train_list$Sigma
-    Sigma_calibration = calibration_list$Sigma
-    Sigma_test = test_list$Sigma
-    
-    sigma_hat = train_list$sigma
-    sigma_calibration = calibration_list$sigma
-    sigma_test = test_list$sigma
-    
-    cat(" \t sigma_hat: ", sigma_hat, "\n")
-    
-  } 
-  else if(data_generating_model == "spatial_custom_rho_and_sigma_eps"){
-    
-    # Generate data with found MLE
-    sigma_eps_hat = 1.1
-    rho_hat = 4.0 
-    
-    # Train
-    train_list = GetBetaAndSigma(X = X_train, Y = Y_train, L = L_train, rho_mle = rho_hat, sigma_eps_mle = sigma_eps_hat)
-    beta_mle = train_list$beta
-    Sigma_train = train_list$Sigma
-    sigma_hat = train_list$sigma
-    
-    # Get calibration Sigma
-    H_calibration = as.matrix(dist(L_calibration, method = "manhattan"))/1000 # distance in kilometers
-    Sigma_calibration <- sigma_hat*exp(-H_calibration*rho_hat) + sigma_eps_hat*diag(N_calibration)
-    
-    # Get test Sigma
-    H_test = as.matrix(dist(L_test, method = "manhattan"))/1000 # distance in kilometers
-    Sigma_test <- sigma_hat*exp(-H_test*rho_hat) + sigma_eps_hat*diag(N_test)
-    
-    cat(" \t sigma_hat: ", sigma_hat, "\n")
-    
+  } else if(noise_type == 2){
+    df_synthetic$noise_sigma = df_synthetic$noise2
+
+  } else if(noise_type == 3){
+    df_synthetic$noise_sigma = df_synthetic$noise3
   }
   
-  y_sampled_train = mvtnorm::rmvnorm(n = 1, mean = X_train%*%beta_mle, sigma = Sigma_train)
-  y_sampled_calibration = mvtnorm::rmvnorm(n = 1, mean = X_calibration%*%beta_mle, sigma = Sigma_calibration)
-  y_sampled_test = mvtnorm::rmvnorm(n = 1, mean = X_test%*%beta_mle, sigma = Sigma_test)
   
-  train_df$SalePrice =  t(y_sampled_train)
-  calibration_df$SalePrice = t(y_sampled_calibration)
-  test_df$SalePrice = t(y_sampled_test)
+  df_synthetic$SalePrice = df_synthetic$preds + rnorm(n = NROW(df_synthetic), mean = 0, sd = df_synthetic$noise_sigma)
+  df_synthetic = df_synthetic %>% select(-lng_norm, -lat_norm, -preds, -noise1, -noise2, -noise3)
   
-  
-  return(list(full_df = rbind(train_df, calibration_df, test_df), 
-              train_df = train_df, 
-              calibration_df = calibration_df, 
-              test_df = test_df, 
-              mle = c(rho_hat, sigma_eps_hat, sigma_hat)))
+  df_synthetic$noise_type = noise_type
+ 
+  return(df_synthetic)
 }
 
-GetBetaAndSigma = function(X, Y, L, rho_mle, sigma_eps_mle){
-  N = NROW(X)
-  
-  X = as.matrix(X)
-  Y = as.matrix(Y)
-  L = as.matrix(L)
-  
-  H = as.matrix(dist(L, method = "manhattan"))/1000 # distance in kilometers
-  Sigma_star_hat <- exp(-H*rho_mle) + sigma_eps_mle*diag(N)
-  Sigma_star_hat_inv <- solve(Sigma_star_hat + 0.001*diag(N))
-  beta_hat_spatial <- solve(t(X)%*%Sigma_star_hat_inv%*%X)%*%t(X)%*%Sigma_star_hat_inv%*%Y
-  
-  r = Y - X%*%beta_hat_spatial
-  sigma_hat_2 <- as.numeric((1/N) * t(r)%*%Sigma_star_hat_inv%*%r)
-  
-  Sigma_hat = sigma_hat_2*Sigma_star_hat + (sigma_eps_mle*sigma_hat_2)*diag(N)
-  
-  return(list(beta = beta_hat_spatial, sigma = sigma_hat_2, Sigma = Sigma_hat))
-}
 
 
 SplitCP_Wrapper_New = function(dfs, 
                                formulas, 
-                               alpha_level = 0.9,
-                               prediction_models = c("xgb"),  
-                               sigma_methods = "one", 
-                               weight_methods = "none", 
-                               my_seed = 999){
+                               alpha_level,
+                               prediction_models,
+                               sigma_methods, 
+                               weight_methods, 
+                               my_seed, 
+                               oracle_params = NA){
   ### Part 0: Untangle
   
   set.seed(my_seed)
@@ -423,7 +388,6 @@ SplitCP_Wrapper_New = function(dfs,
   calibration_df$alpha_hi = NA
   test_df$alpha_lo = NA
   test_df$alpha_hi = NA
-  
   train_df$model_sd = NA
   calibration_df$model_sd = NA
   test_df$model_sd = NA
@@ -441,14 +405,15 @@ SplitCP_Wrapper_New = function(dfs,
   train_df_all_models = data.frame()
   calibration_df_all_models = data.frame()
   test_df_all_models = data.frame()
-  
+
   
   for(i in 1:N_prediction_models){
     this_model = TrainModels(train_df = train_df, 
-                             calibration_df = calibration_df, 
-                             test_df = test_df, 
-                             model_formula = model_formula, 
-                             prediction_model = prediction_models[i])
+                     calibration_df = calibration_df, 
+                     test_df = test_df, 
+                     model_formula = model_formula, 
+                     prediction_model = prediction_models[i], 
+                     params = oracle_params)
     
     train_df_all_models = rbind(train_df_all_models, this_model$train_df)
     calibration_df_all_models = rbind(calibration_df_all_models, this_model$calibration_df)
@@ -456,14 +421,14 @@ SplitCP_Wrapper_New = function(dfs,
     
   }
   
-  
+
   ### Step 2: Get all the non-conformity scores
   train_df_all_sigmas = data.frame()
   calibration_df_all_sigmas = data.frame()
   test_df_all_sigmas = data.frame()
   
   for(i in 1:N_score_functions){
-    
+ 
     ### Add sigma
     cat("\t Non-conformity score: ", sigma_methods[i], "\n")
     
@@ -480,45 +445,28 @@ SplitCP_Wrapper_New = function(dfs,
     test_df_all_sigmas = rbind(test_df_all_sigmas, dfs_with_sigma$test_df)
   }
   
-  
+ 
   ### Step 3: Get all the weightings
   all_runs_train = data.frame()
   all_runs_calibration = data.frame()
   all_runs_test = data.frame()
   
+
+  
   
   for(j in 1:N_weight_methods){
     
     cat("Weight method: ", weight_methods[j], "\n")
-    
-    if(weight_methods[j] == "proximity"){
-      cat("Training proximity matrix ... \n")
-      ranger_formula = model_formula
-      # ranger_formula = as.formula(SalePrice ~ lng + lat)
-      ranger_mtry = length(all.vars(ranger_formula))-1
-      ranger_model = ranger::ranger(formula = ranger_formula, 
-                                    data = train_df,
-                                    max.depth = 8,
-                                    mtry = ranger_mtry,
-                                    num.trees = 200)
-      
-      calibration_leafs = predict(object = ranger_model, calibration_df, type = "terminalNodes")$prediction
-      
-    } else{
-      ranger_model = NA
-      calibration_leafs = NA
-    }
-    
+   
     start_time = Sys.time()
     one_run = SplitCP3_MultipleSigmas(dfs = list(train = train_df_all_sigmas, 
                                                  calibration = calibration_df_all_sigmas, 
                                                  test = test_df_all_sigmas), 
-                                      formulas = formulas, 
+                                       formulas = formulas, 
                                       alpha_level = alpha_level, 
-                                      prediction_model = prediction_model, 
-                                      weight_method = weight_methods[j], 
-                                      calibration_leafs = calibration_leafs, 
-                                      ranger_model = ranger_model)
+                                       prediction_model = prediction_model, 
+                                       weight_method = weight_methods[j], 
+                                       ranger_model = ranger_model)
     end_time = Sys.time()
     
     all_runs_train = rbind(all_runs_train, one_run$train)
@@ -529,7 +477,7 @@ SplitCP_Wrapper_New = function(dfs,
   
   ### Check for Spatial Oracle method
   if("spatial" %in% prediction_models){
-    
+   
     # Make a copy and change sigma_method to "Oracle"
     train_df_copy = all_runs_train %>% 
       filter(prediction_model == "spatial", 
@@ -577,19 +525,22 @@ GetSigma = function(train_df, calibration_df, test_df, sigma_method, sigma_hat_f
     mutate(res = SalePrice - predictions, 
            abs_res = abs(res), 
            score_function = sigma_method) %>% 
-    filter(!(prediction_model != "random forest" & score_function == "cqr"))
+    filter(!(prediction_model == "random forest" & score_function == "cqr_lightgbm")) %>% 
+    filter(!(prediction_model == "lightgbm" & score_function == "cqr_rf"))
   
   calibration_df = calibration_df %>%
     mutate(res = SalePrice - predictions, 
            abs_res = abs(res), 
            score_function = sigma_method)  %>% 
-    filter(!(prediction_model != "random forest" & score_function == "cqr"))
+    filter(!(prediction_model == "random forest" & score_function == "cqr_lightgbm")) %>% 
+    filter(!(prediction_model == "lightgbm" & score_function == "cqr_rf"))
   
   test_df = test_df %>%
     mutate(res = NA, 
            abs_res = NA, 
            score_function = sigma_method) %>% 
-    filter(!(prediction_model != "random forest" & score_function == "cqr"))
+    filter(!(prediction_model == "random forest" & score_function == "cqr_lightgbm")) %>% 
+    filter(!(prediction_model == "lightgbm" & score_function == "cqr_rf"))
   
   
   if(sigma_method == "one"){
@@ -597,23 +548,71 @@ GetSigma = function(train_df, calibration_df, test_df, sigma_method, sigma_hat_f
     calibration_df = calibration_df %>% mutate(sigma_hat = 1)
     test_df = test_df %>% mutate(sigma_hat = 1)
     
-  } else if(sigma_method == "CityDistrictMean"){
+  } 
+  else if(sigma_method == "CityDistrictMean"){
     train_df$sigma_hat = train_df$CityDistrictPriceLevel 
     calibration_df$sigma_hat = calibration_df$CityDistrictPriceLevel 
     test_df$sigma_hat = test_df$CityDistrictPriceLevel 
     
-  } else if(sigma_method == "yhat"){
+  } 
+  else if(sigma_method == "yhat"){
     train_df$sigma_hat = train_df$predictions
     calibration_df$sigma_hat =  calibration_df$predictions 
     test_df$sigma_hat = test_df$predictions 
+  
+  } 
+  else if (sigma_method == "lm"){
+    unique_models = unique(train_df$prediction_model)
+    N_unique_models = length(unique_models)
     
-  } else if (sigma_method == "lm"){
-    difficulty_model = lm(formula = sigma_hat_formula, data = train_df)
-    train_df$sigma_hat = predict(difficulty_model, train_df)
-    calibration_df$sigma_hat = predict(difficulty_model, calibration_df)
-    test_df$sigma_hat = predict(difficulty_model, test_df)
+    train_df_copy = data.frame()
+    calibration_df_copy = data.frame()
+    test_df_copy = data.frame()
     
-  } else if(sigma_method == "cqr"){
+    # This should be possible to do in a clever way with dplyr
+    for(i in 1:N_unique_models){
+      
+      # Train difficulty model
+      train_df_subset = train_df %>% filter(prediction_model == unique_models[i])
+      calibration_df_subset = calibration_df %>% filter(prediction_model == unique_models[i])
+      test_df_subset = test_df %>% filter(prediction_model == unique_models[i])
+      
+      difficulty_model = lm(formula = sigma_hat_formula, data = train_df_subset)
+      
+      # Fit to subset
+      train_df_subset$sigma_hat = predict(difficulty_model, train_df_subset)
+      calibration_df_subset$sigma_hat = predict(difficulty_model, calibration_df_subset)
+      test_df_subset$sigma_hat = predict(difficulty_model, test_df_subset)
+      
+
+      # Bind
+      train_df_copy = rbind(train_df_copy,train_df_subset)
+      calibration_df_copy = rbind(calibration_df_copy, calibration_df_subset)
+      test_df_copy = rbind(test_df_copy, test_df_subset)
+      
+      
+    }
+    
+    #difficulty_model = lm(formula = sigma_hat_formula, data = train_df)
+    #train_df$sigma_hat = predict(difficulty_model, train_df)
+    #calibration_df$sigma_hat = predict(difficulty_model, calibration_df)
+    #test_df$sigma_hat = predict(difficulty_model, test_df)
+    
+    # Try adding a safety mechanism
+    train_df = train_df_copy %>% 
+      mutate(sigma_hat = case_when(sigma_hat < 0.01 ~ 0.01, 
+                                   TRUE ~ sigma_hat))
+    
+    calibration_df = calibration_df_copy %>% 
+      mutate(sigma_hat = case_when(sigma_hat < 0.01 ~ 0.01, 
+                                   TRUE ~ sigma_hat))
+    
+    test_df = test_df_copy %>% 
+      mutate(sigma_hat = case_when(sigma_hat < 0.01 ~ 0.01, 
+                                   TRUE ~ sigma_hat))
+    
+  } 
+  else if(sigma_method == "cqr_rf"){
     
     ### Step 1: Train model
     train_x = train_df %>% dplyr::select(all.vars(model_formula)[-1])
@@ -629,7 +628,7 @@ GetSigma = function(train_df, calibration_df, test_df, sigma_method, sigma_hat_f
     qrf_model = quantregForest(x = train_x,
                                y = as.numeric(train_y),
                                nthreads = 1)
-    
+
     ### Step 2: Predict
     
     train_qrf = predict(object = qrf_model, 
@@ -661,7 +660,70 @@ GetSigma = function(train_df, calibration_df, test_df, sigma_method, sigma_hat_f
     calibration_df$sigma_hat = 1
     test_df$sigma_hat = 1
     
-  } else if(sigma_method == "spatial_oracle"){
+  } 
+  else if(sigma_method == "cqr_lightgbm"){
+    
+    
+    
+    model_data_train <- model.frame(model_formula, train_df)
+    features_train <- model.matrix(model_formula, model_data_train)[, -1]
+    
+    model_data_calibration <- model.frame(model_formula, calibration_df)
+    features_calibration <- model.matrix(model_formula, model_data_calibration)[, -1]
+
+    model_data_test <- model.frame(model_formula, test_df)
+    features_test <- model.matrix(model_formula, model_data_test)[, -1]
+    
+    
+    
+    
+    # Create LightGBM dataset
+    lgb_train <- lgb.Dataset(data = as.matrix(features_train), label = model_data_train$SalePrice)
+    
+    # Train the model
+    model_lower <- lgb.train(
+      params = list(learning_rate = 0.03, max_depth = 4,objective = "quantile", alpha = 0.5-alpha/2),
+      data = lgb_train,
+      nrounds = 1000,
+      verbose = -1
+    )
+    
+    model_median <- lgb.train(
+      params = list(learning_rate = 0.03, max_depth = 4,objective = "quantile", alpha = 0.5),
+      data = lgb_train,
+      nrounds = 1000,
+      verbose = -1
+    )
+    
+    
+    model_upper <- lgb.train(
+      params = list(learning_rate = 0.03, max_depth = 4,objective = "quantile", alpha = 0.5 + alpha/2),
+      data = lgb_train,
+      nrounds = 1000,
+      verbose = -1
+    )
+    
+    
+    
+    # Make predictions
+    train_df$alpha_lo <- predict(model_lower, as.matrix(features_train))
+    train_df$predictions <- predict(model_median, as.matrix(features_train))
+    train_df$alpha_hi <- predict(model_upper, as.matrix(features_train))
+    
+    calibration_df$alpha_lo <- predict(model_lower, as.matrix(features_calibration))
+    calibration_df$predictions <- predict(model_median, as.matrix(features_calibration))
+    calibration_df$alpha_hi <- predict(model_upper, as.matrix(features_calibration))
+
+    test_df$alpha_lo <- predict(model_lower, as.matrix(features_test))
+    test_df$predictions <- predict(model_median, as.matrix(features_test))
+    test_df$alpha_hi <- predict(model_upper, as.matrix(features_test))
+  
+    train_df$sigma_hat = 1
+    calibration_df$sigma_hat = 1
+    test_df$sigma_hat = 1
+  
+    } 
+  else if(sigma_method == "spatial_oracle"){
     train_df$sigma_hat = 1
     calibration_df$sigma_hat = 1
     test_df$sigma_hat = 1
@@ -669,6 +731,8 @@ GetSigma = function(train_df, calibration_df, test_df, sigma_method, sigma_hat_f
     train_df$Ri = train_df$oracle_score
     calibration_df$Ri = calibration_df$oracle_score
     test_df$Ri = test_df$oracle_score
+    
+    
   }
   
   
@@ -678,7 +742,7 @@ GetSigma = function(train_df, calibration_df, test_df, sigma_method, sigma_hat_f
   test_df = test_df %>% mutate(Ri = NA) 
   
   ### Special case: Conformalized Quantile Regression
-  if(sigma_method == "cqr"){
+  if(sigma_method %in% c("cqr_rf", "cqr_lightgbm")){
     
     # This is eq. (9) in Romano et al (2019)
     train_df = train_df %>%
@@ -690,8 +754,8 @@ GetSigma = function(train_df, calibration_df, test_df, sigma_method, sigma_hat_f
                        calibration_df$SalePrice - calibration_df$alpha_hi)) 
     
     test_df = test_df %>% mutate(Ri = NA) 
-    
-    
+  
+ 
   } 
   
   
@@ -703,12 +767,11 @@ GetSigma = function(train_df, calibration_df, test_df, sigma_method, sigma_hat_f
 
 
 SplitCP3_MultipleSigmas = function(dfs, 
-                                   formulas,
-                                   alpha_level,
-                                   prediction_model,
-                                   weight_method, 
-                                   calibration_leafs, 
-                                   ranger_model){
+                    formulas,
+                    alpha_level,
+                    prediction_model,
+                    weight_method, 
+                    ranger_model){
   
   ## Part 0: Untangle
   train_df = dfs$train
@@ -718,7 +781,7 @@ SplitCP3_MultipleSigmas = function(dfs,
   N_train = NROW(train_df)
   N_calib = NROW(calibration_df)
   N_test = NROW(test_df)
-  
+
   model_formula = formulas$pred
   sigma_hat_formula = formulas$sigma_hat
   
@@ -727,13 +790,13 @@ SplitCP3_MultipleSigmas = function(dfs,
   calibration_df = calibration_df %>% mutate(weight_method = weight_method)
   test_df = test_df %>% mutate(weight_method = weight_method, q90 = as.numeric(NA)) 
   
-  
+
   ### Prepare for multiple rows 
   unique_test_ids = unique(test_df$TransactionID)
   N_test_unique = length(unique_test_ids)
   test_df_all = data.frame()
   
-  
+
   # New method
   train_df = train_df %>% mutate(model_and_score = paste(prediction_model, score_function, sep = "_"))
   calibration_df = calibration_df %>% mutate(model_and_score = paste(prediction_model, score_function, sep = "_"))
@@ -757,25 +820,22 @@ SplitCP3_MultipleSigmas = function(dfs,
       b = 10^6
       ww = exp(-dist^2/b)
       
-    } else if(weight_method == "spatial_nn"){
-      dist = sqrt((test_subset$Longitude[1] - calibration_df$Longitude)^2 + (test_subset$Latitude[1] - calibration_df$Latitude)^2)
-      ww = ifelse(dist < 1000, 1, 0)
-      if(sum(ww) == 0){
-        cat("No neighbors within 1 km!\n")
-        #WW = rep(1, NROW(calibration_df))
-        ww = ifelse(dist < 5000, 1, 0)
-      }
       
-    } else if(weight_method == "proximity"){
-      ww = GetProximityOneRow(ranger_model = ranger_model, 
-                              calibration_leafs = calibration_leafs, 
-                              test_row = test_subset[1,])
-      ww = exp(ww) - 1
-    } 
-    
-    else if(weight_method == "mondrian"){
+    } else if(weight_method == "spatial_nn"){
+      dist_threshold = 1000
+      dist = sqrt((test_subset$Longitude[1] - calibration_df$Longitude)^2 + (test_subset$Latitude[1] - calibration_df$Latitude)^2)
+      ww = ifelse(dist < dist_threshold, 1, 0)
+      
+      while(sum(ww) == 0){
+        cat("No neighbors within ", dist_threshold, "! \n")
+        dist_threshold = dist_threshold + 500
+        ww = ifelse(dist < dist_threshold, 1, 0) 
+      }
+    } else if(weight_method %in% c("mondrian", "mondrian_subcity")){
       break 
     }
+    
+
     
     
     # Normalize weights
@@ -789,11 +849,11 @@ SplitCP3_MultipleSigmas = function(dfs,
       test_subset$q90[s] = as.numeric(modi::weighted.quantile(x = calibration_subset$Ri, 
                                                               w = ww_normalized, 
                                                               prob = alpha_level)) 
-      
-    }
+      }
+    
     test_df_all = rbind(test_df_all, test_subset)
     
-    
+
   } # for loop
   
   
@@ -806,13 +866,11 @@ SplitCP3_MultipleSigmas = function(dfs,
       test_subset = test_df %>% 
         filter(model_and_score == unique_scores[s]) %>% 
         mutate(q90 = as.numeric(quantile(x = calibration_subset$Ri, prob = alpha_level)))
-      test_df_all = rbind(test_df_all, test_subset)
+    test_df_all = rbind(test_df_all, test_subset)
     } # for
-  } # if 
-  
+    } # if 
   
   ### SPECIAL TREATMENT 2: Mondrian CP
-  
   if(weight_method == "mondrian"){
     test_df_all = data.frame()
     unique_cd = unique(test_df$CityDistrict)
@@ -827,21 +885,21 @@ SplitCP3_MultipleSigmas = function(dfs,
         test_subset = test_df %>% filter(model_and_score == unique_scores[s], 
                                          CityDistrict == unique_cd[cd])
         
-        test_subset = test_subset %>% mutate(q90 = as.numeric(quantile(x = calibration_subset$Ri,
-                                                                       prob = alpha_level)))
-        test_df_all = rbind(test_df_all, test_subset)
+      test_subset = test_subset %>% mutate(q90 = as.numeric(quantile(x = calibration_subset$Ri,
+                                                                     prob = alpha_level)))
+      test_df_all = rbind(test_df_all, test_subset)
       } # for city districts
       
     } # for scores
   } # if 
-  test_df_with_confidence = test_df_all %>% 
-    mutate(
-      Pq05 = case_when(score_function == "cqr" ~ alpha_lo - q90, 
-                       score_function != "cqr" ~ predictions - sigma_hat*q90), 
-      Pq95 = case_when(score_function == "cqr" ~ alpha_hi + q90, 
-                       score_function != "cqr" ~ predictions + sigma_hat*q90))
-  
-  
+    
+    test_df_with_confidence = test_df_all %>% 
+      mutate(
+        Pq05 = case_when(score_function %in% c("cqr_rf", "cqr_lightgbm") ~ alpha_lo - q90, 
+                         TRUE ~ predictions - sigma_hat*q90), 
+        Pq95 = case_when(score_function %in% c("cqr_rf", "cqr_lightgbm") ~ alpha_hi + q90, 
+                         TRUE ~ predictions + sigma_hat*q90))
+    
   new_dfs = list(train = train_df, calibration = calibration_df, test = test_df_with_confidence)
   
   return(new_dfs)
