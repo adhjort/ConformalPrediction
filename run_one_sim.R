@@ -3,13 +3,14 @@ source("./helping_functions.R")
 formulas = list(pred = as.formula(SalePrice ~ PRom + BRA + lng + lat + Altitude  + NumberOfBedrooms + 
                                     Floor + YearsSinceBuilt + CoastDistance + LakeDistance + NumberOfUnitsOnAddress + 
                                     CityDistrict + HomesNearby + OtherBuildingsNearby + Balcony + Elevator),
-                sigma_hat = as.formula(abs_res ~ PRom + BRA + lng + lat + Altitude  + NumberOfBedrooms + 
-                                         Floor + YearsSinceBuilt + CoastDistance + LakeDistance + NumberOfUnitsOnAddress + 
-                                         CityDistrict + HomesNearby + OtherBuildingsNearby + Balcony + Elevator))
+                sigma_hat = sigma_hat = as.formula(abs_res ~ PRom + as.factor(CityDistrict) + as.factor(SaleMonth))) # + 
 
-prediction_models = c("random forest", "xgb", "lm", "spatial")
-sigmas = c("one", "yhat", "lm", "CityDistrictMean", "cqr")
-weights = c("none", "spatial", "mondrian", "spatial_nn", "proximity")
+
+
+prediction_models = c("random forest", "lightgbm")
+sigmas = c("cqr_lightgbm", "cqr_rf", "yhat", "lm", "one")
+weights = c("none", "spatial", "spatial_nn", "mondrian")
+
 
 alphas = 0.9
 sim = 10
